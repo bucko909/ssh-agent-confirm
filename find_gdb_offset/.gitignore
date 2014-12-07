@@ -1,0 +1,7 @@
+*.ko
+*.o
+Module.symvers
+modules.order
+.tmp_versions
+*.cmd
+print_offset
