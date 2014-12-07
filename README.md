@@ -26,6 +26,8 @@ and in any case ssh-agent won't invoke $SSH_ASKPASS if $DISPLAY is not set.
 
 Make sure you ssh-add with the '-c' commandline parameter, or the script won't be invoked.
 
+You'll need zenity (it's used to display dialogs from bash).
+
 
 FILES
 =====
