@@ -1,0 +1,126 @@
+#!/bin/bash
+
+mkdir -p ~/.ssh_agent_confirm
+cd ~/.ssh_agent_confirm
+if [ ! -e auto_allow ]; then
+	touch auto_allow
+fi
+
+log() {
+	echo "$(date +%s) $*" >> log
+}
+
+MY_PPID=$PPID
+
+fingerprint="$(echo "$*" | tail -n 1 | sed 's/^Key fingerprint \([0-9a-f:]*\)\.$/\1/')"
+comment="$(echo "$*" | head -n 1 | sed 's/^Allow use of key \(.*\)?$/\1/')"
+key_only_check=true
+
+if [ -z "$fingerprint" ]; then
+	zenity --warning --text="$0: Cannot parse SSH key fingerprint from:\n\n$*"
+	exit 1
+fi
+
+if [ -z "$comment" ]; then
+	zenity --warning --text="$0: Cannot parse SSH key comment from:\n\n$*"
+	exit 1
+fi
+
+# Do quick check for allowed fingerprints with no other constraints.
+# We can avoid calling netstat et al in this case.
+if $key_only_check && grep -qE "^KEY ($fingerprint|ANY)\>" auto_allow; then
+	log "WHITELIST_AUTH KEY $fingerprint"
+	notify-send --urgency=critical --app-name="ssh_agent_askpass" --expire-time=15000 "SSH key authed" "SSH key $fingerprint used (process not checked)"
+	exit 0
+fi
+
+socks_filter="$(readlink /proc/self/fd/*|grep socket|grep -o '[0-9][0-9]*' | tr '\n' '|' | sed 's/|$//;s/|/\\|/g')"
+pid="$(sudo netstat_unix 2> /dev/null | grep "^$MY_PPID:\($socks_filter\)" | cut -d: -f3)"
+if [ "$(echo "$pid" | wc -l)" != "1" ]; then
+	zenity --warning --text="$0: Spawning PID is not unique; I found:\n$pid"
+	exit 1
+fi
+
+# id also has the start time in jiffies.
+pid_id="$pid-$(cut -d' ' -f22 < /proc/"$pid"/stat)"
+cmdline="$(tr '\0' ' ' < /proc/"$pid"/cmdline)"
+cmdline_hash="$(echo "$cmdline" | sha1sum | cut -d' ' -f1)"
+
+# Check against whitelist fully now that we know everything
+if grep -qE "BASIC ($fingerprint|ANY) ($pid_id|ANY) ($cmdline_hash|ANY)\>" auto_allow; then
+	log "WHITELIST_AUTH BASIC $fingerprint $pid_id $cmdline"
+	notify-send --urgency=critical --app-name="ssh_agent_askpass" --expire-time=15000 "SSH key authed" "SSH key $fingerprint used by pid $pid:\n$cmdline"
+	exit 0
+fi
+
+if echo "$cmdline" | grep -qEf <(grep -E "^COMMANDLINE_REGEX ($fingerprint|ANY)\>" auto_allow | sed 's/^COMMANDLINE_REGEX [^ ]* //'); then
+	log "WHITELIST_AUTH COMMANDLINE_REGEX $fingerprint $pid_id $cmdline"
+	notify-send --urgency=critical --app-name="ssh_agent_askpass" --expire-time=15000 "SSH key authed" "SSH key $fingerprint used by pid $pid:\n$cmdline"
+	exit 0
+fi
+
+pid_message="Pid $pid: $cmdline"
+
+selections="$(zenity --list --text="Incoming ssh-agent auth request for $comment ($fingerprint), from:\n$pid_message\n\nAllow?" --checklist --multiple --column= --column=  --separator=: IGNORED "Always allow ..." IGNORED "... but only this key" IGNORED "... but only from this process" IGNORED "... but only from this commandline" IGNORED "Edit commandline regex?")"
+retval=$?
+
+IFS=":"
+for word in $selections; do
+	case $word in
+		"Always allow ...")
+			always=1
+			;;
+		"... but only this key")
+			thiskeyonly=1
+			;;
+		"... but only from this process")
+			thispidonly=1
+			;;
+		"... but only from this commandline")
+			thiscmdlineonly=1
+			;;
+		"Edit commandline regex?")
+			editregex=1
+			;;
+		*)
+			zenity --warning --text="$0: Unknown return from zenity: m${word}m"
+			exit 1
+	esac
+done
+
+if [ "$always" = "1" ]; then
+	if [ -z "$thiskeyonly" ]; then
+		key_filter="ANY"
+	else
+		key_filter="$fingerprint"
+	fi
+	if [ -z "$editregex" ]; then
+		if [ -z "$thispidonly" ]; then
+			pid_filter="ANY"
+		else
+			pid_filter="$pid_id"
+		fi
+		if [ -z "$thiscmdlineonly" ]; then
+			cmd_filter="ANY"
+		else
+			cmd_filter="$cmdline_hash -- cmdline=$cmdline"
+		fi
+		if [ "$pid_filter $cmd_filter" = "ANY ANY" ]; then
+			echo "KEY $key_filter" >> auto_allow
+			log "WHITELIST_ADD KEY $key_filter"
+		else
+			echo "BASIC $key_filter $pid_filter $cmd_filter" >> auto_allow
+			log "WHITELIST_ADD BASIC $key_filter $pid_filter $cmd_filter"
+		fi
+	else
+		regex_filter="$(zenity --entry --text="Edit commandline regex to suit" --entry-text="^$(echo "$cmdline" | sed 's/\([^a-z0-9 _@:./"'\''-]\)/\\\1/g')")"
+		if [ "$?" = "0" ] && [ -n "$regex_filter" ]; then
+			echo "COMMANDLINE_REGEX $key_filter $regex_filter" >> auto_allow
+			log "WHITELIST_ADD COMMANDLINE_REGEX $key_filter $regex_filter"
+		else
+			exit 1
+		fi
+	fi
+fi
+
+exit $retval
